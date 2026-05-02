@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 
 type Verdict = "send" | "reword" | "wait";
@@ -16,6 +16,15 @@ type CheckResult = {
   };
   verdict: Verdict;
   verdict_reason: string;
+};
+
+type HistoryItem = {
+  ts: number;
+  draft: string;
+  channel: string;
+  relationship: string;
+  verdict: Verdict;
+  preview: string;
 };
 
 const CHANNELS = [
@@ -59,16 +68,42 @@ const SAMPLES: { name: string; channel: string; relationship: string; draft: str
     draft:
       "Hey — I think we need to part ways. The last two deliverables missed the spec we agreed on and the timeline keeps slipping. I don't think this is working out. We'll pay through the end of the week but I'd like to wrap up by Friday. Can you send over what you have so far?",
   },
+  {
+    name: "Setting a boundary with family",
+    channel: "text",
+    relationship: "family",
+    draft:
+      "Hey mom — I love you and I know you mean well but I really can't keep getting calls about when I'm having kids. It's stressful and it makes me not want to pick up. Can we just not for a while? I'll bring it up if and when there's news.",
+  },
+];
+
+const LOADING_MESSAGES = [
+  "Reading your draft",
+  "Listening for tone",
+  "Checking power dynamics",
+  "Spotting misread risks",
+  "Drafting three variants",
+  "Picking the verdict",
 ];
 
 const VERDICT_META: Record<
   Verdict,
-  { label: string; bg: string; color: string; emoji: string }
+  { label: string; bg: string; color: string }
 > = {
-  send: { label: "Send it", bg: "#E8F0E8", color: "#2D8B5F", emoji: "Go" },
-  reword: { label: "Reword first", bg: "#FAEFE0", color: "#C97D2F", emoji: "Edit" },
-  wait: { label: "Don't send yet", bg: "#FAE3DE", color: "#B0392B", emoji: "Wait" },
+  send: { label: "Send it", bg: "#E6EFE5", color: "#2D8B5F" },
+  reword: { label: "Reword first", bg: "#FAEFE0", color: "#C97D2F" },
+  wait: { label: "Don't send yet", bg: "#FAE3DE", color: "#B0392B" },
 };
+
+const HISTORY_KEY = "sendcheck.history.v1";
+const MAX_HISTORY = 3;
+const SOFT_LIMIT = 7000;
+const HARD_LIMIT = 8000;
+
+function detectModKey() {
+  if (typeof navigator === "undefined") return "Ctrl";
+  return /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘" : "Ctrl";
+}
 
 export default function HomePage() {
   const [draft, setDraft] = useState("");
@@ -78,11 +113,85 @@ export default function HomePage() {
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [progressMsg, setProgressMsg] = useState(LOADING_MESSAGES[0]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [modKey, setModKey] = useState("Ctrl");
   const resultRef = useRef<HTMLDivElement>(null);
 
-  async function runCheck() {
+  // Load history + detect platform on mount.
+  useEffect(() => {
+    setModKey(detectModKey());
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as HistoryItem[];
+        if (Array.isArray(parsed)) setHistory(parsed.slice(0, MAX_HISTORY));
+      }
+    } catch {
+      /* ignore corrupt history */
+    }
+  }, []);
+
+  // Rotate loading messages while waiting.
+  useEffect(() => {
+    if (!loading) return;
+    let i = 0;
+    setProgressMsg(LOADING_MESSAGES[0]);
+    const interval = setInterval(() => {
+      i = (i + 1) % LOADING_MESSAGES.length;
+      setProgressMsg(LOADING_MESSAGES[i]);
+    }, 1800);
+    return () => clearInterval(interval);
+  }, [loading]);
+
+  function persistHistory(next: HistoryItem[]) {
+    setHistory(next);
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+    } catch {
+      /* quota or disabled — silently ignore */
+    }
+  }
+
+  function saveToHistory(d: string, c: string, r: string, v: Verdict) {
+    const item: HistoryItem = {
+      ts: Date.now(),
+      draft: d,
+      channel: c,
+      relationship: r,
+      verdict: v,
+      preview: d.replace(/\s+/g, " ").slice(0, 60).trim(),
+    };
+    const next = [item, ...history.filter((h) => h.draft !== d)].slice(0, MAX_HISTORY);
+    persistHistory(next);
+  }
+
+  function loadFromHistory(item: HistoryItem) {
+    setDraft(item.draft);
+    setChannel(item.channel);
+    setRelationship(item.relationship);
+    setResult(null);
+    setError(null);
+  }
+
+  function clearHistory() {
+    persistHistory([]);
+  }
+
+  function resetForm() {
+    setDraft("");
+    setResult(null);
+    setError(null);
+  }
+
+  const runCheck = useCallback(async () => {
+    if (loading) return;
     if (!draft.trim() || draft.trim().length < 10) {
       setError("Paste at least a couple of sentences for a meaningful check.");
+      return;
+    }
+    if (draft.length > HARD_LIMIT) {
+      setError(`Draft is ${draft.length} chars — keep it under ${HARD_LIMIT}.`);
       return;
     }
     setLoading(true);
@@ -100,6 +209,7 @@ export default function HomePage() {
       }
       const data = (await res.json()) as CheckResult;
       setResult(data);
+      saveToHistory(draft, channel, relationship, data.verdict);
       setTimeout(() => {
         resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       }, 100);
@@ -108,7 +218,19 @@ export default function HomePage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [draft, channel, relationship, loading, history]);
+
+  // Cmd/Ctrl + Enter from anywhere triggers submit.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        runCheck();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [runCheck]);
 
   function loadSample(s: (typeof SAMPLES)[number]) {
     setDraft(s.draft);
@@ -128,6 +250,26 @@ export default function HomePage() {
     }
   }
 
+  function copyAllVariants() {
+    if (!result) return;
+    const block =
+      `--- SOFTER ---\n${result.variants.softer}\n\n` +
+      `--- NEUTRAL ---\n${result.variants.neutral}\n\n` +
+      `--- SHARPER ---\n${result.variants.sharper}\n`;
+    copyText(block, "all-variants");
+  }
+
+  const charCount = draft.length;
+  const charColor =
+    charCount >= HARD_LIMIT
+      ? "var(--color-danger)"
+      : charCount >= SOFT_LIMIT
+      ? "var(--color-warning)"
+      : "var(--color-text-muted)";
+  const charsLeft = HARD_LIMIT - charCount;
+  const charLabel =
+    charCount >= SOFT_LIMIT ? `${charsLeft} chars left` : `${charCount} chars`;
+
   return (
     <>
       <header className="border-b border-[var(--color-border-light)]">
@@ -144,13 +286,13 @@ export default function HomePage() {
             </span>
           </div>
           <span className="text-xs text-[var(--color-text-muted)] hidden sm:block">
-            Free · No signup · Your draft is never stored
+            Free · No signup · Drafts never stored
           </span>
         </div>
       </header>
 
       <main className="pb-24">
-        <section className="pt-16 pb-10 md:pt-24 md:pb-14">
+        <section className="pt-14 pb-8 md:pt-20 md:pb-12">
           <div className="max-w-[820px] mx-auto px-6 text-center">
             <motion.p
               initial={{ opacity: 0, y: 12 }}
@@ -181,6 +323,38 @@ export default function HomePage() {
           </div>
         </section>
 
+        {history.length > 0 && (
+          <section className="px-6 mb-6">
+            <div className="max-w-[820px] mx-auto flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">
+                Recent
+              </span>
+              {history.map((h) => (
+                <button
+                  key={h.ts}
+                  type="button"
+                  onClick={() => loadFromHistory(h)}
+                  className="chip"
+                  title={`${h.channel} · ${h.relationship}`}
+                >
+                  <span
+                    className="w-2 h-2 rounded-full"
+                    style={{ background: VERDICT_META[h.verdict].color }}
+                  />
+                  <span className="truncate max-w-[200px]">{h.preview}…</span>
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={clearHistory}
+                className="text-xs text-[var(--color-text-muted)] underline decoration-1 underline-offset-2 hover:text-[var(--color-accent)]"
+              >
+                clear
+              </button>
+            </div>
+          </section>
+        )}
+
         <section className="px-6">
           <motion.div
             initial={{ opacity: 0, y: 24 }}
@@ -190,11 +364,9 @@ export default function HomePage() {
           >
             <div className="space-y-6">
               <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">
-                    Where you&apos;re sending it
-                  </label>
-                </div>
+                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)] block mb-2">
+                  Where you&apos;re sending it
+                </label>
                 <div className="flex flex-wrap gap-2">
                   {CHANNELS.map((c) => (
                     <button
@@ -232,8 +404,11 @@ export default function HomePage() {
                   <label className="text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">
                     Your draft
                   </label>
-                  <span className="text-xs text-[var(--color-text-muted)]">
-                    {draft.length} chars
+                  <span
+                    className="text-xs tabular-nums"
+                    style={{ color: charColor }}
+                  >
+                    {charLabel}
                   </span>
                 </div>
                 <textarea
@@ -242,6 +417,7 @@ export default function HomePage() {
                   rows={9}
                   placeholder="Paste your message here..."
                   className="input font-[var(--font-body)] text-base leading-relaxed resize-y min-h-[200px]"
+                  style={charCount >= HARD_LIMIT ? { borderColor: "var(--color-danger)" } : undefined}
                 />
                 <div className="mt-3 flex flex-wrap gap-2 items-center">
                   <span className="text-xs text-[var(--color-text-muted)]">Try one:</span>
@@ -258,45 +434,34 @@ export default function HomePage() {
                 </div>
               </div>
 
-              <div className="flex items-center justify-between gap-4 pt-2">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-2">
                 <p className="text-xs text-[var(--color-text-muted)] flex-1">
-                  Powered by Claude · Your draft is sent to the model and not stored on our
-                  side.
+                  Powered by Claude · Drafts go to the model and aren&apos;t stored on our side.
                 </p>
-                <button
-                  type="button"
-                  onClick={runCheck}
-                  disabled={loading || draft.trim().length < 10}
-                  className="btn-primary"
-                >
-                  {loading ? (
-                    <span className="inline-flex items-center gap-2">
-                      Checking
-                      <span className="inline-flex">
-                        <span
-                          className="dot-pulse"
-                          style={{ animationDelay: "0s" }}
-                        >
-                          .
-                        </span>
-                        <span
-                          className="dot-pulse"
-                          style={{ animationDelay: "0.2s" }}
-                        >
-                          .
-                        </span>
-                        <span
-                          className="dot-pulse"
-                          style={{ animationDelay: "0.4s" }}
-                        >
-                          .
+                <div className="flex items-center gap-3 self-end sm:self-auto">
+                  <span className="text-xs text-[var(--color-text-muted)] hidden sm:block tabular-nums">
+                    {modKey}+Enter
+                  </span>
+                  <button
+                    type="button"
+                    onClick={runCheck}
+                    disabled={loading || draft.trim().length < 10 || charCount > HARD_LIMIT}
+                    className="btn-primary"
+                  >
+                    {loading ? (
+                      <span className="inline-flex items-center gap-2">
+                        <span className="inline-block min-w-[140px] text-left">{progressMsg}</span>
+                        <span className="inline-flex">
+                          <span className="dot-pulse" style={{ animationDelay: "0s" }}>.</span>
+                          <span className="dot-pulse" style={{ animationDelay: "0.2s" }}>.</span>
+                          <span className="dot-pulse" style={{ animationDelay: "0.4s" }}>.</span>
                         </span>
                       </span>
-                    </span>
-                  ) : (
-                    "Check my message"
-                  )}
-                </button>
+                    ) : (
+                      "Check my message"
+                    )}
+                  </button>
+                </div>
               </div>
 
               <AnimatePresence>
@@ -308,14 +473,21 @@ export default function HomePage() {
                     className="overflow-hidden"
                   >
                     <div
-                      className="text-sm rounded-xl p-4 border"
+                      className="text-sm rounded-xl p-4 border flex items-start justify-between gap-3"
                       style={{
                         background: "#FAE3DE",
                         borderColor: "#E8B4A8",
                         color: "#7A1A0F",
                       }}
                     >
-                      {error}
+                      <span className="leading-relaxed">{error}</span>
+                      <button
+                        type="button"
+                        onClick={() => setError(null)}
+                        className="shrink-0 text-xs underline underline-offset-2 hover:no-underline"
+                      >
+                        dismiss
+                      </button>
                     </div>
                   </motion.div>
                 )}
@@ -357,18 +529,14 @@ export default function HomePage() {
                 </div>
 
                 <div className="card">
-                  <h3 className="font-[var(--font-heading)] text-2xl mb-2">
-                    Tone reading
-                  </h3>
+                  <h3 className="font-[var(--font-heading)] text-2xl mb-2">Tone reading</h3>
                   <p className="text-[var(--color-text-secondary)] leading-relaxed">
                     {result.tone}
                   </p>
                 </div>
 
                 <div className="card">
-                  <h3 className="font-[var(--font-heading)] text-2xl mb-2">
-                    Power dynamic
-                  </h3>
+                  <h3 className="font-[var(--font-heading)] text-2xl mb-2">Power dynamic</h3>
                   <p className="text-[var(--color-text-secondary)] leading-relaxed">
                     {result.power}
                   </p>
@@ -386,9 +554,16 @@ export default function HomePage() {
                 </div>
 
                 <div className="card">
-                  <h3 className="font-[var(--font-heading)] text-2xl mb-4">
-                    Three rewrites
-                  </h3>
+                  <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+                    <h3 className="font-[var(--font-heading)] text-2xl">Three rewrites</h3>
+                    <button
+                      type="button"
+                      onClick={copyAllVariants}
+                      className="text-xs font-medium text-[var(--color-accent)] hover:text-[var(--color-accent-hover)] underline decoration-2 underline-offset-4"
+                    >
+                      {copied === "all-variants" ? "All copied" : "Copy all three"}
+                    </button>
+                  </div>
                   <div className="space-y-4">
                     {(["softer", "neutral", "sharper"] as const).map((variantKey) => {
                       const text = result.variants[variantKey];
@@ -427,18 +602,52 @@ export default function HomePage() {
                     })}
                   </div>
                 </div>
+
+                <div className="flex justify-center pt-4">
+                  <button
+                    type="button"
+                    onClick={resetForm}
+                    className="text-sm font-medium text-[var(--color-text-secondary)] underline decoration-2 underline-offset-4 decoration-[var(--color-border)] hover:decoration-[var(--color-accent)] hover:text-[var(--color-accent)] transition-colors"
+                  >
+                    Start over with a new draft
+                  </button>
+                </div>
               </div>
             </motion.section>
           )}
         </AnimatePresence>
       </main>
 
-      <footer className="border-t border-[var(--color-border-light)] py-8 mt-12">
-        <div className="max-w-[1100px] mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-[var(--color-text-muted)]">
-          <span>© SendCheck. A second opinion before you hit send.</span>
-          <span>
-            Built with Claude · Not legal advice · Use your own judgment
-          </span>
+      <footer className="border-t border-[var(--color-border-light)] py-10 mt-12">
+        <div className="max-w-[1100px] mx-auto px-6 grid sm:grid-cols-3 gap-6 text-xs text-[var(--color-text-muted)]">
+          <div>
+            <div className="font-[var(--font-heading)] text-base font-semibold text-[var(--color-primary)] mb-2">
+              SendCheck
+            </div>
+            <p className="leading-relaxed">
+              A second opinion before you hit send. Free, no signup, runs on Claude.
+            </p>
+          </div>
+          <div>
+            <div className="font-semibold text-[var(--color-text-secondary)] mb-2 uppercase tracking-wider">
+              Privacy
+            </div>
+            <p className="leading-relaxed">
+              Drafts are sent to the language model for analysis and not persisted on our
+              servers. History stays in your browser only.
+            </p>
+          </div>
+          <div>
+            <div className="font-semibold text-[var(--color-text-secondary)] mb-2 uppercase tracking-wider">
+              Use it well
+            </div>
+            <p className="leading-relaxed">
+              SendCheck is a sanity check, not legal/HR advice. Final call is yours.
+            </p>
+          </div>
+        </div>
+        <div className="max-w-[1100px] mx-auto px-6 mt-8 pt-4 border-t border-[var(--color-border-light)] text-center text-xs text-[var(--color-text-muted)]">
+          © 2026 SendCheck · Built end-to-end with Claude
         </div>
       </footer>
     </>
