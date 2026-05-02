@@ -1,8 +1,8 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { spawn } from "child_process";
 import { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
-export const maxDuration = 30;
+export const maxDuration = 120;
 
 type Verdict = "send" | "reword" | "wait";
 
@@ -15,7 +15,7 @@ type CheckResult = {
   verdict_reason: string;
 };
 
-const SYSTEM_PROMPT = `You are a sharp, calm communications coach. Read messages the way the recipient will read them, not the way the sender hopes.
+const PROMPT_HEADER = `You are a sharp, calm communications coach. Read messages the way the recipient will read them, not the way the sender hopes.
 
 Respond with ONLY one valid JSON object — no commentary, no markdown, no code fences.
 
@@ -40,11 +40,11 @@ Hard rules:
 - Quote actual phrases from the draft when calling out tone or risks. Specificity > abstraction.
 - Variants MUST preserve names, dates, dollar amounts, deadlines, and other concrete facts.
 - Variants must match the channel: Slack/text are casual, email is more formal, LinkedIn is professional but not corporate.
-- "wait" only when there's a concrete reason to delay — escalation visible, key info missing, sender clearly emotional. Otherwise "send" or "reword".
-- No moralizing. No "consider how this might affect the relationship." Just useful, specific reads.
+- "wait" only when there's a concrete reason to delay. Otherwise "send" or "reword".
+- No moralizing. Just useful, specific reads.
 - If the draft is already well-calibrated, give "send" with a one-sentence confirmation. Don't invent problems.`;
 
-function buildUserMessage({
+function buildPrompt({
   draft,
   channel,
   relationship,
@@ -53,7 +53,11 @@ function buildUserMessage({
   channel: string;
   relationship: string;
 }) {
-  return `Channel: ${channel}
+  return `${PROMPT_HEADER}
+
+---
+
+Channel: ${channel}
 Relationship to recipient: ${relationship}
 
 Draft:
@@ -61,7 +65,7 @@ Draft:
 ${draft}
 """
 
-Return only the JSON object.`;
+Return only the JSON object now.`;
 }
 
 function isValidResult(x: unknown): x is CheckResult {
@@ -76,6 +80,66 @@ function isValidResult(x: unknown): x is CheckResult {
   if (r.verdict !== "send" && r.verdict !== "reword" && r.verdict !== "wait") return false;
   if (typeof r.verdict_reason !== "string") return false;
   return true;
+}
+
+function callClaudeCode(prompt: string, timeoutMs = 110_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const args = ["-p", "--output-format", "text", "--allowedTools", ""];
+    const proc = spawn("claude", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, CI: "1", NO_COLOR: "1" },
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      reject(new Error(`claude -p timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    proc.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString("utf8");
+    });
+    proc.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString("utf8");
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(stdout.trim());
+      } else {
+        const tail = (stderr || stdout).trim().slice(-400);
+        reject(new Error(`claude -p exit ${code}: ${tail || "no output"}`));
+      }
+    });
+
+    proc.stdin.write(prompt);
+    proc.stdin.end();
+  });
+}
+
+function stripFences(s: string): string {
+  let t = s.trim();
+  // Strip leading ```json or ```
+  t = t.replace(/^```(?:json|JSON)?\s*\n?/, "");
+  // Strip trailing ```
+  t = t.replace(/\n?\s*```\s*$/, "");
+  // Some models include a leading "Here is the JSON:" preamble; cut to first {
+  const firstBrace = t.indexOf("{");
+  const lastBrace = t.lastIndexOf("}");
+  if (firstBrace > 0 && lastBrace > firstBrace) {
+    t = t.slice(firstBrace, lastBrace + 1);
+  }
+  return t.trim();
 }
 
 export async function POST(req: NextRequest) {
@@ -97,41 +161,21 @@ export async function POST(req: NextRequest) {
     return new Response("Draft is too long — keep it under 8000 characters.", { status: 400 });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return new Response("Server is missing ANTHROPIC_API_KEY.", { status: 500 });
-  }
-
-  const client = new Anthropic({ apiKey });
-
   let raw: string;
   try {
-    const resp = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1500,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: buildUserMessage({ draft, channel, relationship }) }],
-    });
-    const block = resp.content[0];
-    if (!block || block.type !== "text") {
-      return new Response("Model returned no text.", { status: 502 });
-    }
-    raw = block.text.trim();
+    raw = await callClaudeCode(buildPrompt({ draft, channel, relationship }));
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Unknown model error";
-    return new Response(`Model error: ${msg}`, { status: 502 });
+    const msg = e instanceof Error ? e.message : String(e);
+    return new Response(`Backend (claude -p) error: ${msg}`, { status: 502 });
   }
 
-  // Strip accidental markdown fences if model added them.
-  if (raw.startsWith("```")) {
-    raw = raw.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
-  }
+  const cleaned = stripFences(raw);
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(cleaned);
   } catch {
-    return new Response("Model output was not valid JSON.", { status: 502 });
+    return new Response(`Model output was not valid JSON. First 200 chars: ${cleaned.slice(0, 200)}`, { status: 502 });
   }
 
   if (!isValidResult(parsed)) {

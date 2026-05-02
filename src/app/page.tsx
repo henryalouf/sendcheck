@@ -198,7 +198,8 @@ export default function HomePage() {
     setError(null);
     setResult(null);
     try {
-      const res = await fetch("/api/check", {
+      const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+      const res = await fetch(`${basePath}/api/check`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ draft, channel, relationship }),
